@@ -1,6 +1,6 @@
 import "./styles/app.css";
 import { el, clear, linkify } from "./ui/dom.ts";
-import { ChatService, type MeshLike } from "./core/service.ts";
+import { ChatService, type MeshLike, type ConnectionState } from "./core/service.ts";
 import {
   publicChannel,
   privateChannel,
@@ -19,36 +19,56 @@ import {
   makeClient,
   meshAdapter,
   fetchIdentity,
-  DEFAULT_NODE_URL,
+  resolveNodeUrl,
 } from "./core/sdk-adapter.ts";
+import {
+  loadChannels,
+  saveChannels,
+  loadDrafts,
+  saveDrafts,
+  loadName,
+  saveName,
+  loadNodeUrl,
+  saveNodeUrl,
+  type StorageLike,
+} from "./core/persist.ts";
 
 /** Default channels every member sees on first load. */
 const DEFAULT_CHANNELS = ["general", "random", "mesh"];
-const NAME_KEY = "ce-chat:name";
+/** Quick-pick reaction emojis. */
+const QUICK_EMOJI = ["👍", "🎉", "❤️", "😂", "👀", "🚀"];
+/** How often we re-publish a typing hint while the user keeps typing. */
+const TYPING_THROTTLE_MS = 2500;
+
+const store: StorageLike = safeStorage();
 
 interface AppState {
   selfId: string;
-  name: string | undefined;
   service: ChatService;
   active: string | null;
-  /** ids of messages whose publish failed (rendered as failed). */
-  failed: Set<string>;
+  /** Per-channel composer drafts (also persisted). */
+  drafts: Map<string, string>;
+  /** Open thread root id (in the active channel), or null. */
+  thread: string | null;
   connectionError: string | null;
+  connection: ConnectionState;
 }
 
-const root = document.getElementById("app")!;
+const root = document.getElementById("app");
 let app: AppState | null = null;
 let heartbeatTimer: number | undefined;
 let presenceTimer: number | undefined;
+let lastTypingSent = 0;
 
-boot();
+if (root) void boot();
 
 async function boot(): Promise<void> {
   renderLoading();
-  const client = makeClient();
+  const nodeUrl = resolveNodeUrl(loadNodeUrl(store));
+  const client = makeClient(nodeUrl);
   try {
     const id = await fetchIdentity(client);
-    const name = localStorage.getItem(NAME_KEY) ?? undefined;
+    const name = loadName(store);
     const mesh: MeshLike = meshAdapter(client);
     const service = new ChatService(mesh, id.nodeId, name, {
       onMessages: (cid) => {
@@ -59,45 +79,69 @@ async function boot(): Promise<void> {
         if (app?.active === cid) renderRoster();
         renderSidebar();
       },
+      onTyping: (cid) => {
+        if (app?.active === cid) renderTyping();
+      },
+      onUnread: () => renderSidebar(),
       onStreamError: (err) => {
         const f = toFriendly(err);
         if (app) app.connectionError = `${f.message}${f.hint ? " " + f.hint : ""}`;
         renderAll();
       },
+      onConnectionChange: (state) => {
+        if (!app) return;
+        app.connection = state;
+        if (state === "live") app.connectionError = null;
+        renderAll();
+      },
     });
-    app = { selfId: id.nodeId, name, service, active: null, failed: new Set(), connectionError: null };
 
-    // Join default channels and select the first.
-    for (const c of DEFAULT_CHANNELS) {
+    app = {
+      selfId: id.nodeId,
+      service,
+      active: null,
+      drafts: loadDrafts(store),
+      thread: null,
+      connectionError: null,
+      connection: "connecting",
+    };
+
+    // Join persisted channels (fall back to defaults on a first run).
+    const persisted = loadChannels(store, id.nodeId);
+    const toJoin: ChannelRef[] = persisted.length > 0 ? persisted : DEFAULT_CHANNELS.map(publicChannel);
+    for (const ref of toJoin) {
       try {
-        await service.join(publicChannel(c));
+        await service.join(ref);
       } catch (e) {
-        // A default channel failing to subscribe shouldn't block boot.
-        console.warn("join failed", c, e);
+        console.warn("join failed", ref.id, e);
       }
     }
+    persistChannels();
     app.active = service.joined()[0]?.id ?? null;
+    if (app.active) service.markRead(app.active);
     service.startStream();
     startTimers();
     renderAll();
   } catch (err) {
-    renderConnectError(err, () => boot());
+    renderConnectError(err, () => void boot());
   }
 }
 
 function startTimers(): void {
   stopTimers();
-  // Heartbeat into the active channel so peers see us.
+  // Heartbeat into ALL joined channels so peers see us even in background channels.
   heartbeatTimer = window.setInterval(() => {
-    if (app?.active) void app.service.heartbeat(app.active);
+    void app?.service.heartbeatAll();
   }, HEARTBEAT_INTERVAL_MS);
-  // Send one immediately so we appear without waiting a full interval.
-  if (app?.active) void app.service.heartbeat(app.active);
-  // Repaint presence to age members out as the TTL passes.
+  void app?.service.heartbeatAll();
+  // Repaint presence/typing to age members out as the TTL passes.
   presenceTimer = window.setInterval(() => {
-    if (app?.active) renderRoster();
+    if (app?.active) {
+      renderRoster();
+      renderTyping();
+    }
     renderSidebar();
-  }, 5000);
+  }, 4000);
 }
 
 function stopTimers(): void {
@@ -105,16 +149,34 @@ function stopTimers(): void {
   if (presenceTimer) window.clearInterval(presenceTimer);
 }
 
+/* ------------------------------------------------------------ guarded access */
+
+/** The active channel ref, or undefined when there is no active channel. */
+function activeRef(): ChannelRef | undefined {
+  const a = app;
+  if (!a || !a.active) return undefined;
+  return a.service.joined().find((r) => r.id === a.active);
+}
+
+/** Mentionable handles for highlighting self in the active channel. */
+function selfHandles(): Set<string> {
+  const out = new Set<string>();
+  if (!app) return out;
+  out.add(app.selfId.toLowerCase());
+  const n = app.service.name;
+  if (n) out.add(n.toLowerCase());
+  return out;
+}
+
 /* ------------------------------------------------------------------ render */
 
 function renderLoading(): void {
+  if (!root) return;
   clear(root);
   root.append(
     el("div", { class: "shell" }, [
       el("aside", { class: "sidebar" }, [brandNode()]),
-      el("section", { class: "main" }, [
-        el("div", { class: "skeleton" }, skeletonRows(6)),
-      ]),
+      el("section", { class: "main" }, [el("div", { class: "skeleton" }, skeletonRows(6))]),
     ]),
   );
 }
@@ -136,7 +198,9 @@ function skeletonRows(n: number): Node[] {
 }
 
 function renderConnectError(err: unknown, retry: () => void): void {
+  if (!root) return;
   const f = toFriendly(err);
+  const nodeUrl = resolveNodeUrl(loadNodeUrl(store));
   clear(root);
   root.append(
     el("div", { class: "shell" }, [
@@ -146,16 +210,11 @@ function renderConnectError(err: unknown, retry: () => void): void {
           el("div", { class: "card" }, [
             el("div", { class: "glyph" }, ["⚓"]),
             el("h3", {}, ["Can't reach your CE node"]),
-            el("p", {}, [
-              "ce-chat talks to a local node over its HTTP+SSE API at ",
-              el("code", {}, [DEFAULT_NODE_URL]),
-              ".",
-            ]),
+            el("p", {}, ["ce-chat talks to a local node over its HTTP+SSE API at ", el("code", {}, [nodeUrl]), "."]),
             el("p", {}, [f.hint ?? "Start your node, then retry."]),
-            el("p", { style: "margin-top:14px" }, [
-              el("code", {}, ["ce start"]),
-            ]),
-            el("div", { class: "modal-actions", style: "justify-content:center;margin-top:20px" }, [
+            el("p", { style: "margin-top:14px" }, [el("code", {}, ["ce start"])]),
+            el("div", { class: "modal-actions", style: "justify-content:center;margin-top:20px;gap:10px" }, [
+              el("button", { class: "btn ghost", onclick: openNodeUrlModal }, ["Change node URL"]),
               el("button", { class: "btn primary", onclick: retry }, ["Retry connection"]),
             ]),
           ]),
@@ -166,24 +225,19 @@ function renderConnectError(err: unknown, retry: () => void): void {
 }
 
 function renderAll(): void {
-  if (!app) return;
+  if (!app || !root) return;
   clear(root);
-  root.append(
-    el("div", { class: "shell" }, [
-      buildSidebar(),
-      buildMain(),
-      buildRoster(),
-    ]),
-  );
+  root.append(el("div", { class: "shell" }, [buildSidebar(), buildMain(), buildRoster()]));
   scrollStreamToBottom();
 }
 
-// Targeted re-renders to avoid rebuilding the whole shell on every frame.
 function renderSidebar(): void {
+  if (!app) return;
   const existing = document.querySelector(".sidebar");
   if (existing) existing.replaceWith(buildSidebar());
 }
 function renderStream(): void {
+  if (!app) return;
   const main = document.querySelector(".main");
   if (main) {
     main.replaceWith(buildMain());
@@ -191,8 +245,15 @@ function renderStream(): void {
   }
 }
 function renderRoster(): void {
+  if (!app) return;
   const existing = document.querySelector(".roster");
   if (existing) existing.replaceWith(buildRoster());
+}
+function renderTyping(): void {
+  if (!app?.active) return;
+  const bar = document.getElementById("typing-bar");
+  const typers = app.service.typers(app.active);
+  if (bar) bar.replaceWith(buildTypingBar(typers));
 }
 
 function brandNode(): Node {
@@ -201,15 +262,13 @@ function brandNode(): Node {
       class: "mark",
       html: `<svg viewBox="0 0 32 32" width="30" height="30"><rect width="32" height="32" rx="8" fill="#0b1f24"/><path d="M4 20c3-4 6 0 9-2s6-6 9-2 6 0 9-2" stroke="#34d0c4" stroke-width="2.4" fill="none" stroke-linecap="round"/><path d="M4 25c3-4 6 0 9-2s6-6 9-2 6 0 9-2" stroke="#1fa99e" stroke-width="1.8" fill="none" stroke-linecap="round" opacity="0.7"/></svg>`,
     }),
-    el("div", {}, [
-      el("h1", {}, ["ce-chat"]),
-      el("p", { class: "tag" }, ["team chat on the Sea"]),
-    ]),
+    el("div", {}, [el("h1", {}, ["ce-chat"]), el("p", { class: "tag" }, ["team chat on the Sea"])]),
   ]);
 }
 
 function buildSidebar(): Node {
-  const a = app!;
+  if (!app) return el("aside", { class: "sidebar" });
+  const a = app;
   const channels = a.service.joined();
   const now = Date.now();
 
@@ -217,32 +276,39 @@ function buildSidebar(): Node {
   for (const ref of channels) {
     const st = a.service.state(ref.id);
     const online = st ? st.presence.onlineCount(now) : 0;
+    const unread = st ? st.unread : 0;
     const isActive = ref.id === a.active;
     list.append(
-      el(
-        "li",
-        {},
-        [
-          el(
-            "button",
-            {
-              class: "chan",
-              "aria-current": isActive ? "true" : "false",
-              onclick: () => selectChannel(ref.id),
-            },
-            [
-              el("span", { class: "sigil", "aria-hidden": "true" }, [sigilFor(ref)]),
-              el("span", { class: "label" }, [ref.label]),
-              ...(ref.kind === "private" ? [el("span", { class: "lock", title: "capability-gated" }, ["lock"])] : []),
-              ...(online > 0 ? [el("span", { class: "count", title: `${online} online` }, [String(online)])] : []),
-            ],
-          ),
-        ],
-      ),
+      el("li", {}, [
+        el(
+          "button",
+          {
+            class: `chan${unread > 0 && !isActive ? " unread" : ""}`,
+            "aria-current": isActive ? "true" : "false",
+            onclick: () => void selectChannel(ref.id),
+          },
+          [
+            el("span", { class: "sigil", "aria-hidden": "true" }, [sigilFor(ref)]),
+            el("span", { class: "label" }, [ref.label]),
+            ...(ref.kind === "private" ? [el("span", { class: "lock", title: "capability-gated" }, ["lock"])] : []),
+            ...(unread > 0 && !isActive
+              ? [el("span", { class: "badge", title: `${unread} unread` }, [String(Math.min(unread, 99))])]
+              : online > 0
+                ? [el("span", { class: "count", title: `${online} online` }, [String(online)])]
+                : []),
+          ],
+        ),
+      ]),
     );
   }
 
-  const offline = !!a.connectionError;
+  const offline = a.connection !== "live" && a.connection !== "connecting";
+  const footText =
+    a.connection === "reconnecting"
+      ? "reconnecting…"
+      : a.connection === "stopped"
+        ? "node unreachable"
+        : `mesh live · ${channels.length} channels`;
   return el("aside", { class: "sidebar" }, [
     brandNode(),
     identityCard(),
@@ -253,7 +319,7 @@ function buildSidebar(): Node {
     list,
     el("div", { class: "sidebar-foot" }, [
       el("span", { class: `dot ${offline ? "warn" : "on"}` }),
-      offline ? "node unreachable" : `mesh live · ${channels.length} channels`,
+      footText,
     ]),
   ]);
 }
@@ -265,10 +331,12 @@ function sigilFor(ref: ChannelRef): string {
 }
 
 function identityCard(): Node {
-  const a = app!;
-  const display = a.name || shortId(a.selfId);
+  if (!app) return el("div", { class: "identity" });
+  const a = app;
+  const name = a.service.name;
+  const display = name || shortId(a.selfId);
   return el("div", { class: "identity" }, [
-    avatarNode(a.name || a.selfId, a.selfId, 36),
+    avatarNode(name || a.selfId, a.selfId, 36),
     el("div", { class: "who" }, [
       el("div", { class: "name" }, [display]),
       el("div", { class: "nid" }, [
@@ -281,21 +349,27 @@ function identityCard(): Node {
 }
 
 function buildMain(): Node {
-  const a = app!;
-  if (!a.active) {
-    return el("section", { class: "main" }, [emptyPane()]);
-  }
-  const ref = a.service.joined().find((r) => r.id === a.active)!;
-  const st = a.service.state(a.active)!;
+  if (!app) return el("section", { class: "main" });
+  const a = app;
+  const ref = activeRef();
+  const st = a.active ? a.service.state(a.active) : undefined;
+  if (!ref || !st) return el("section", { class: "main" }, [emptyPane()]);
+
   const now = Date.now();
   const online = st.presence.onlineCount(now);
 
-  const stream = el("div", { class: "stream", id: "stream", role: "log", "aria-live": "polite", "aria-label": `${ref.label} messages` });
-  const msgs = st.store.list();
-  if (msgs.length === 0) {
+  const stream = el("div", {
+    class: "stream",
+    id: "stream",
+    role: "log",
+    "aria-live": "polite",
+    "aria-label": `${ref.label} messages`,
+  });
+  const roots = st.store.roots();
+  if (roots.length === 0) {
     stream.append(emptyChannel(ref));
   } else {
-    renderMessages(stream, msgs);
+    renderMessages(stream, roots);
   }
 
   const main = el("section", { class: "main" }, [
@@ -306,31 +380,44 @@ function buildMain(): Node {
       ]),
       el("span", { class: "topic", title: ref.topic }, [ref.topic]),
       el("div", { class: "spacer" }),
-      el("div", { class: "presence-chip", title: `${online} online` }, [
-        el("span", { class: "dot on" }),
-        `${online} online`,
-      ]),
+      el(
+        "button",
+        { class: "ghost-btn", title: "Reload history from peers", onclick: () => void a.service.requestHistory(ref.id, true) },
+        ["history"],
+      ),
+      el("div", { class: "presence-chip", title: `${online} online` }, [el("span", { class: "dot on" }), `${online} online`]),
     ]),
   ]);
 
-  if (a.connectionError) {
+  if (a.connectionError && a.connection !== "live") {
     main.append(
       el("div", { class: "banner error", role: "alert" }, [
         el("span", {}, ["⚠"]),
-        el("span", {}, [a.connectionError]),
-        el("button", { onclick: () => boot() }, ["Reconnect"]),
+        el("span", {}, [a.connection === "reconnecting" ? "Reconnecting to the mesh…" : a.connectionError]),
+        ...(a.connection === "reconnecting" ? [] : [el("button", { onclick: () => void boot() }, ["Reconnect"])]),
       ]),
     );
   }
 
-  main.append(stream, buildComposer(ref));
-  return main;
+  main.append(stream, buildTypingBar(a.service.typers(ref.id)), buildComposer(ref));
+  // Thread side-pane.
+  const section = el("div", { class: "main-with-thread" }, [main]);
+  if (a.thread) {
+    const pane = buildThreadPane(ref, a.thread);
+    if (pane) section.append(pane);
+  }
+  return section;
 }
 
 function renderMessages(stream: HTMLElement, msgs: StoredMessage[]): void {
+  if (!app?.active) return;
+  const st = app.service.state(app.active);
+  const lastReadAt = st?.lastReadAt ?? 0;
   let lastDay = "";
   let prevFrom = "";
   let prevTs = 0;
+  let unreadDividerShown = false;
+  const handles = selfHandles();
   for (const m of msgs) {
     const day = new Date(m.ts || m.receivedAt).toDateString();
     if (day !== lastDay) {
@@ -338,18 +425,26 @@ function renderMessages(stream: HTMLElement, msgs: StoredMessage[]): void {
       lastDay = day;
       prevFrom = "";
     }
+    if (!unreadDividerShown && !m.isSelf && m.receivedAt > lastReadAt && (st?.unread ?? 0) > 0) {
+      stream.append(el("div", { class: "unread-div" }, ["new messages"]));
+      unreadDividerShown = true;
+      prevFrom = "";
+    }
     const grouped = m.from === prevFrom && m.ts - prevTs < 5 * 60 * 1000 && prevFrom !== "";
-    stream.append(messageNode(m, grouped));
+    stream.append(messageNode(m, grouped, handles));
     prevFrom = m.from;
     prevTs = m.ts || m.receivedAt;
   }
 }
 
-function messageNode(m: StoredMessage, grouped: boolean): Node {
-  const a = app!;
-  const failed = a.failed.has(m.id);
+function messageNode(m: StoredMessage, grouped: boolean, handles: Set<string>): Node {
+  if (!app) return document.createTextNode("");
+  const a = app;
   const author = m.name || shortId(m.from);
-  const cls = ["msg", grouped ? "grouped" : "", m.pending ? "pending" : "", failed ? "failed" : ""].filter(Boolean).join(" ");
+  const failed = m.status === "failed";
+  const cls = ["msg", grouped ? "grouped" : "", m.status === "pending" ? "pending" : "", failed ? "failed" : "", m.deleted ? "deleted" : ""]
+    .filter(Boolean)
+    .join(" ");
 
   const head = grouped
     ? null
@@ -357,16 +452,137 @@ function messageNode(m: StoredMessage, grouped: boolean): Node {
         el("span", { class: `author ${m.isSelf ? "self" : ""}` }, [author]),
         ...(m.name ? [el("span", { class: "nid" }, [shortId(m.from, 4, 4)])] : []),
         el("span", { class: "stamp" }, [clockTime(m.ts || m.receivedAt)]),
+        ...(m.editedAt ? [el("span", { class: "edited", title: "edited" }, ["(edited)"])] : []),
       ]);
 
-  const body = el("div", { class: "body" }, linkify(m.text));
-  if (m.pending) body.append(el("span", { class: "pending-tag" }, ["sending"]));
-  if (failed) body.append(el("span", { class: "failed-tag" }, ["failed"]));
+  const body = el("div", { class: "body" }, m.deleted ? [el("span", { class: "tombstone" }, ["message deleted"])] : linkify(m.text, handles));
+  if (m.status === "pending") body.append(el("span", { class: "pending-tag" }, ["sending"]));
+  if (failed) {
+    body.append(el("span", { class: "failed-tag" }, ["failed"]));
+    body.append(
+      el("button", { class: "retry-btn", title: "Retry send", onclick: () => void retrySend(m.id) }, ["retry"]),
+    );
+  }
 
-  return el("div", { class: cls }, [
-    el("div", { class: "avatar-cell" }, [grouped ? document.createTextNode("") : avatarNode(author, m.from, 34)]),
-    el("div", {}, [...(head ? [head] : []), body]),
+  const reactionBar = m.reactions && m.reactions.length > 0 && !m.deleted ? buildReactionBar(m) : null;
+
+  const replyN = a.active ? (a.service.state(a.active)?.store.replyCount(m.id) ?? 0) : 0;
+  const threadLink =
+    replyN > 0 && !m.replyTo
+      ? el("button", { class: "thread-link", onclick: () => openThread(m.id) }, [`${replyN} ${replyN === 1 ? "reply" : "replies"}`])
+      : null;
+
+  const actions = m.deleted
+    ? null
+    : el("div", { class: "msg-actions" }, [
+        el("button", { title: "Add reaction", "aria-label": "Add reaction", onclick: (e) => openReactionPicker(e as MouseEvent, m) }, ["+"]),
+        el("button", { title: "Reply in thread", "aria-label": "Reply in thread", onclick: () => openThread(m.replyTo || m.id) }, ["reply"]),
+        ...(m.isSelf
+          ? [
+              el("button", { title: "Edit", "aria-label": "Edit message", onclick: () => beginEdit(m) }, ["edit"]),
+              el("button", { title: "Delete", "aria-label": "Delete message", onclick: () => void deleteMsg(m.id) }, ["del"]),
+            ]
+          : []),
+      ]);
+
+  const right = el("div", { class: "msg-right" }, [
+    ...(head ? [head] : []),
+    body,
+    ...(reactionBar ? [reactionBar] : []),
+    ...(threadLink ? [threadLink] : []),
   ]);
+
+  return el("div", { class: cls, "data-id": m.id }, [
+    el("div", { class: "avatar-cell" }, [grouped ? document.createTextNode("") : avatarNode(author, m.from, 34)]),
+    right,
+    ...(actions ? [actions] : []),
+  ]);
+}
+
+function buildReactionBar(m: StoredMessage): Node {
+  const bar = el("div", { class: "reactions" });
+  for (const g of m.reactions ?? []) {
+    const mine = app ? g.reactors.includes(app.selfId.toLowerCase()) : false;
+    bar.append(
+      el(
+        "button",
+        {
+          class: `chip${mine ? " mine" : ""}`,
+          title: `${g.reactors.length} reacted`,
+          onclick: () => void toggleReaction(m, g.emoji, mine ? "remove" : "add"),
+        },
+        [g.emoji, " ", String(g.reactors.length)],
+      ),
+    );
+  }
+  return bar;
+}
+
+function buildTypingBar(typers: { nodeId: string; name?: string }[]): Node {
+  const names = typers.map((t) => t.name || shortId(t.nodeId)).slice(0, 3);
+  let text = "";
+  if (names.length === 1) text = `${names[0]} is typing…`;
+  else if (names.length === 2) text = `${names[0]} and ${names[1]} are typing…`;
+  else if (names.length >= 3) text = `${names[0]}, ${names[1]} and others are typing…`;
+  return el("div", { class: `typing-bar${text ? " active" : ""}`, id: "typing-bar", "aria-live": "polite" }, text ? [text] : []);
+}
+
+function buildThreadPane(ref: ChannelRef, rootId: string): Node | null {
+  if (!app?.active) return null;
+  const st = app.service.state(app.active);
+  if (!st) return null;
+  const root = st.store.list().find((m) => m.id === rootId);
+  const replies = st.store.replies(rootId);
+  const handles = selfHandles();
+  const list = el("div", { class: "thread-stream" });
+  if (root) list.append(messageNode(root, false, handles));
+  list.append(el("div", { class: "thread-sep" }, [`${replies.length} ${replies.length === 1 ? "reply" : "replies"}`]));
+  for (const r of replies) list.append(messageNode(r, false, handles));
+  return el("aside", { class: "thread-pane", "aria-label": "Thread" }, [
+    el("header", { class: "thread-head" }, [
+      el("h3", {}, ["Thread"]),
+      el("button", { class: "ghost-btn", title: "Close thread", onclick: closeThread }, ["close"]),
+    ]),
+    list,
+    buildThreadComposer(ref, rootId),
+  ]);
+}
+
+function buildThreadComposer(ref: ChannelRef, rootId: string): Node {
+  let value = "";
+  const ta = el("textarea", {
+    placeholder: "Reply in thread…",
+    rows: 1,
+    "aria-label": "Reply in thread",
+    oninput: (e) => (value = (e.target as HTMLTextAreaElement).value),
+    onkeydown: (e) => {
+      const ke = e as KeyboardEvent;
+      if (ke.key === "Enter" && !ke.shiftKey) {
+        ke.preventDefault();
+        void sendThreadReply();
+      }
+    },
+  }) as HTMLTextAreaElement;
+  return el("div", { class: "thread-composer" }, [
+    ta,
+    el("button", { class: "btn primary sm", onclick: () => void sendThreadReply() }, ["Reply"]),
+  ]);
+
+  async function sendThreadReply(): Promise<void> {
+    if (!app?.active) return;
+    const text = value.trim();
+    if (text.length === 0 || utf8Len(text) > MAX_TEXT_LEN) return;
+    value = "";
+    ta.value = "";
+    try {
+      await app.service.send(app.active, text, rootId);
+      renderStream();
+    } catch (err) {
+      flash(`Couldn't reply: ${toFriendly(err).message}`);
+      renderStream();
+    }
+    void ref;
+  }
 }
 
 function avatarNode(label: string, idForHue: string, size: number): HTMLElement {
@@ -382,18 +598,21 @@ function avatarNode(label: string, idForHue: string, size: number): HTMLElement 
   );
 }
 
-let composerValue = "";
 function buildComposer(ref: ChannelRef): Node {
-  const a = app!;
+  if (!app) return el("div", { class: "composer" });
+  const a = app;
+  const draft = a.drafts.get(ref.id) ?? "";
   const ta = el("textarea", {
     placeholder: `Message ${ref.kind === "dm" ? ref.label : "#" + ref.label}…`,
     rows: 1,
     "aria-label": `Message ${ref.label}`,
     oninput: (e) => {
       const t = e.target as HTMLTextAreaElement;
-      composerValue = t.value;
+      a.drafts.set(ref.id, t.value);
+      persistDrafts();
       autoGrow(t);
       updateComposerMeta();
+      maybeSendTyping();
     },
     onkeydown: (e) => {
       const ke = e as KeyboardEvent;
@@ -403,11 +622,13 @@ function buildComposer(ref: ChannelRef): Node {
       }
     },
   }) as HTMLTextAreaElement;
-  ta.value = composerValue;
+  ta.value = draft;
 
-  const send = el("button", { class: "send", title: "Send (Enter)", "aria-label": "Send message", onclick: () => void doSend() }, [
-    el("span", { html: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M4 12l16-8-6 8 6 8-16-8z" fill="currentColor"/></svg>` }),
-  ]);
+  const send = el(
+    "button",
+    { class: "send", title: "Send (Enter)", "aria-label": "Send message", onclick: () => void doSend() },
+    [el("span", { html: `<svg width="18" height="18" viewBox="0 0 24 24" fill="none"><path d="M4 12l16-8-6 8 6 8-16-8z" fill="currentColor"/></svg>` })],
+  );
 
   const meta = el("div", { class: "meta", id: "composer-meta" }, [
     el("span", {}, [ref.kind === "dm" ? "Direct message · end-to-mesh" : "Enter to send · Shift+Enter for newline"]),
@@ -420,10 +641,7 @@ function buildComposer(ref: ChannelRef): Node {
     updateComposerMeta();
   });
 
-  return el("div", { class: "composer" }, [
-    el("div", { class: "box" }, [ta, send]),
-    meta,
-  ]);
+  return el("div", { class: "composer" }, [el("div", { class: "box" }, [ta, send]), meta]);
 
   function autoGrow(t: HTMLTextAreaElement): void {
     t.style.height = "auto";
@@ -431,48 +649,150 @@ function buildComposer(ref: ChannelRef): Node {
   }
   function updateComposerMeta(): void {
     const count = document.getElementById("char-count");
-    const sendBtn = document.querySelector(".send") as HTMLButtonElement | null;
-    const len = utf8Len(composerValue.trim());
+    const sendBtn = document.querySelector(".composer .send") as HTMLButtonElement | null;
+    const len = utf8Len((a.drafts.get(ref.id) ?? "").trim());
     if (count) {
       count.textContent = len > MAX_TEXT_LEN - 200 ? `${len}/${MAX_TEXT_LEN}` : "";
       count.className = len > MAX_TEXT_LEN ? "over" : "";
     }
-    if (sendBtn) sendBtn.disabled = len === 0 || len > MAX_TEXT_LEN || !!a.connectionError;
+    if (sendBtn) sendBtn.disabled = len === 0 || len > MAX_TEXT_LEN;
+  }
+  function maybeSendTyping(): void {
+    const now = Date.now();
+    if (now - lastTypingSent < TYPING_THROTTLE_MS) return;
+    if ((a.drafts.get(ref.id) ?? "").trim().length === 0) return;
+    lastTypingSent = now;
+    void a.service.sendTyping(ref.id);
   }
 }
 
 async function doSend(): Promise<void> {
-  const a = app!;
-  if (!a.active) return;
-  const text = composerValue.trim();
+  const a = app;
+  if (!a || !a.active) return;
+  const cid = a.active;
+  const text = (a.drafts.get(cid) ?? "").trim();
   if (text.length === 0 || utf8Len(text) > MAX_TEXT_LEN) return;
-  composerValue = "";
-  let optimisticId: string | undefined;
+  a.drafts.delete(cid);
+  persistDrafts();
   try {
-    const m = await a.service.send(a.active, text);
-    optimisticId = m.id;
-    a.failed.delete(m.id);
+    await a.service.send(cid, text);
     renderStream();
   } catch (err) {
-    if (optimisticId) a.failed.add(optimisticId);
     const f = toFriendly(err);
-    a.connectionError = f.kind === "offline" || f.kind === "auth" ? `${f.message}${f.hint ? " " + f.hint : ""}` : null;
+    if (f.kind === "offline" || f.kind === "auth") a.connectionError = `${f.message}${f.hint ? " " + f.hint : ""}`;
     renderStream();
-    // surface transient send errors without blowing away the channel
     flash(`Couldn't send: ${f.message}`);
   }
 }
 
+async function retrySend(id: string): Promise<void> {
+  if (!app?.active) return;
+  try {
+    await app.service.retry(app.active, id);
+    renderStream();
+  } catch (err) {
+    flash(`Retry failed: ${toFriendly(err).message}`);
+    renderStream();
+  }
+}
+
+async function toggleReaction(m: StoredMessage, emoji: string, op: "add" | "remove"): Promise<void> {
+  if (!app?.active) return;
+  try {
+    await app.service.react(app.active, m.from, m.id, emoji, op);
+    renderStream();
+  } catch (err) {
+    flash(`Reaction failed: ${toFriendly(err).message}`);
+  }
+}
+
+async function deleteMsg(id: string): Promise<void> {
+  if (!app?.active) return;
+  try {
+    await app.service.delete(app.active, id);
+    renderStream();
+  } catch (err) {
+    flash(`Delete failed: ${toFriendly(err).message}`);
+  }
+}
+
+function beginEdit(m: StoredMessage): void {
+  let value = m.text;
+  const input = el("textarea", {
+    value,
+    rows: 3,
+    "aria-label": "Edit message",
+    oninput: (e) => (value = (e.target as HTMLTextAreaElement).value),
+  }) as HTMLTextAreaElement;
+  input.value = m.text;
+  const close = openModal("Edit message", "Your edit is broadcast to the channel; peers see an (edited) marker.", [
+    el("div", { class: "field" }, [input]),
+    el("div", { class: "modal-actions" }, [
+      el("button", { class: "btn ghost", onclick: () => close() }, ["Cancel"]),
+      el("button", { class: "btn primary", onclick: save }, ["Save"]),
+    ]),
+  ]);
+  queueMicrotask(() => input.focus());
+  async function save(): Promise<void> {
+    if (!app?.active) return close();
+    const text = value.trim();
+    if (text.length === 0 || utf8Len(text) > MAX_TEXT_LEN) return;
+    close();
+    try {
+      await app.service.edit(app.active, m.id, text);
+      renderStream();
+    } catch (err) {
+      flash(`Edit failed: ${toFriendly(err).message}`);
+    }
+  }
+}
+
+function openReactionPicker(ev: MouseEvent, m: StoredMessage): void {
+  ev.stopPropagation();
+  const existing = document.getElementById("emoji-pop");
+  if (existing) existing.remove();
+  const pop = el("div", { id: "emoji-pop", class: "emoji-pop", role: "menu" });
+  for (const e of QUICK_EMOJI) {
+    pop.append(
+      el("button", { title: `React ${e}`, onclick: () => { pop.remove(); void toggleReaction(m, e, "add"); } }, [e]),
+    );
+  }
+  document.body.append(pop);
+  const target = ev.currentTarget as HTMLElement;
+  const r = target.getBoundingClientRect();
+  pop.style.left = `${Math.max(8, r.left - 40)}px`;
+  pop.style.top = `${Math.max(8, r.top - 48)}px`;
+  const onAway = (e: MouseEvent): void => {
+    if (!pop.contains(e.target as Node)) {
+      pop.remove();
+      document.removeEventListener("mousedown", onAway);
+    }
+  };
+  queueMicrotask(() => document.addEventListener("mousedown", onAway));
+}
+
+function openThread(rootId: string): void {
+  if (!app) return;
+  app.thread = rootId;
+  renderStream();
+}
+function closeThread(): void {
+  if (!app) return;
+  app.thread = null;
+  renderStream();
+}
+
 function buildRoster(): Node {
-  const a = app!;
-  if (!a.active) return el("aside", { class: "roster" });
-  const st = a.service.state(a.active);
+  if (!app) return el("aside", { class: "roster" });
+  const a = app;
+  const st = a.active ? a.service.state(a.active) : undefined;
+  if (!a.active || !st) return el("aside", { class: "roster" });
   const now = Date.now();
-  const members: Member[] = st ? st.presence.list(now) : [];
+  const members: Member[] = st.presence.list(now);
   const ul = el("ul", { role: "list" });
   for (const m of members) {
     const online = now - m.lastSeen <= PRESENCE_TTL_MS;
-    const label = m.isSelf ? (a.name || "you") + " (you)" : m.name || shortId(m.nodeId);
+    const label = m.isSelf ? (a.service.name || "you") + " (you)" : m.name || shortId(m.nodeId);
     ul.append(
       el("li", { class: `member ${online ? "" : "offline"}` }, [
         avatarNode(m.name || m.nodeId, m.nodeId, 28),
@@ -484,10 +804,7 @@ function buildRoster(): Node {
       ]),
     );
   }
-  return el("aside", { class: "roster", "aria-label": "Members" }, [
-    el("h3", {}, [`Members · ${members.length}`]),
-    ul,
-  ]);
+  return el("aside", { class: "roster", "aria-label": "Members" }, [el("h3", {}, [`Members · ${members.length}`]), ul]);
 }
 
 function emptyPane(): Node {
@@ -510,10 +827,8 @@ function emptyChannel(ref: ChannelRef): Node {
           ? "This is the beginning of your direct conversation over the CE mesh."
           : "This channel is a mesh pubsub topic. Anything you send is gossiped to every subscribed peer in real time.",
       ]),
-      el("p", { style: "margin-top:8px" }, [
-        "Topic: ",
-        el("code", {}, [ref.topic]),
-      ]),
+      el("p", { style: "margin-top:8px" }, ["Asking peers for recent history…"]),
+      el("p", { style: "margin-top:8px" }, ["Topic: ", el("code", {}, [ref.topic])]),
     ]),
   ]);
 }
@@ -532,9 +847,9 @@ function friendlyDay(ts: number): string {
 async function selectChannel(id: string): Promise<void> {
   if (!app) return;
   app.active = id;
-  composerValue = "";
+  app.thread = null;
+  app.service.markRead(id);
   renderAll();
-  // Heartbeat into the newly active channel right away.
   void app.service.heartbeat(id);
 }
 
@@ -567,15 +882,27 @@ function flash(msg: string): void {
   flashTimer = window.setTimeout(() => bar?.remove(), 2400);
 }
 
+/* ----------------------------------------------------------- persistence ops */
+
+function persistChannels(): void {
+  if (!app) return;
+  saveChannels(store, app.service.joined());
+}
+function persistDrafts(): void {
+  if (!app) return;
+  saveDrafts(store, app.drafts);
+}
+
 /* ------------------------------------------------------------------ modals */
 
 function openNameModal(): void {
-  const a = app!;
-  let value = a.name ?? "";
+  if (!app) return;
+  const a = app;
+  let value = a.service.name ?? "";
   const input = el("input", {
     value,
     placeholder: "e.g. Leif",
-    maxlength: 40,
+    maxlength: 64,
     "aria-label": "Display name",
     oninput: (e) => (value = (e.target as HTMLInputElement).value),
     onkeydown: (e) => {
@@ -599,24 +926,34 @@ function openNameModal(): void {
 
   function save(): void {
     const name = value.trim() || undefined;
-    if (name) localStorage.setItem(NAME_KEY, name);
-    else localStorage.removeItem(NAME_KEY);
-    // Rebuild the service with the new name (service captures name at construction).
-    rebuildServiceWithName(name);
+    saveName(store, name);
+    // Apply in place — no reload, no data loss.
+    a.service.setDisplayName(name);
+    flash(name ? `Name set to ${name}` : "Name cleared");
+    // Re-announce presence under the new name in every channel.
+    void a.service.heartbeatAll();
     close();
+    renderAll();
   }
 }
 
-function rebuildServiceWithName(name: string | undefined): void {
-  // Simplest correct path: persist + reload so every channel re-announces presence
-  // with the new name and the service captures it cleanly. Reload is instant against
-  // a live local node and keeps the data path honest.
-  if (!app) return;
-  app.name = name;
-  flash(name ? `Name set to ${name}` : "Name cleared");
-  // Reannounce presence immediately under the new name without a full reload:
-  // we cannot mutate the captured name, so reload to keep one source of truth.
-  location.reload();
+function openNodeUrlModal(): void {
+  let value = loadNodeUrl(store) ?? "";
+  const input = el("input", {
+    value,
+    placeholder: "http://127.0.0.1:8844",
+    class: "mono",
+    "aria-label": "Node URL",
+    oninput: (e) => (value = (e.target as HTMLInputElement).value),
+  }) as HTMLInputElement;
+  const close = openModal("Node URL", "Point ce-chat at a different CE node (e.g. a remote node or an alternate port).", [
+    el("div", { class: "field" }, [el("label", {}, ["HTTP+SSE base URL"]), input]),
+    el("div", { class: "modal-actions" }, [
+      el("button", { class: "btn ghost", onclick: () => { saveNodeUrl(store, undefined); close(); flash("Node URL reset"); void boot(); } }, ["Reset to default"]),
+      el("button", { class: "btn primary", onclick: () => { saveNodeUrl(store, value.trim() || undefined); close(); void boot(); } }, ["Save & connect"]),
+    ]),
+  ]);
+  queueMicrotask(() => input.focus());
 }
 
 function openComposeModal(): void {
@@ -626,7 +963,7 @@ function openComposeModal(): void {
   let dmInput = "";
   let errMsg = "";
 
-  const render = () => {
+  const render = (): void => {
     clear(body);
     const tabs = el("div", { class: "tabs", role: "tablist" }, [
       tabBtn("Channel", tab === "channel", () => setTab("channel")),
@@ -675,7 +1012,8 @@ function openComposeModal(): void {
   }
 
   async function submit(): Promise<void> {
-    const a = app!;
+    if (!app) return;
+    const a = app;
     errMsg = "";
     try {
       let ref: ChannelRef;
@@ -700,6 +1038,7 @@ function openComposeModal(): void {
         ref = tab === "channel" ? publicChannel(name) : privateChannel(name);
       }
       await a.service.join(ref);
+      persistChannels();
       a.active = ref.id;
       a.connectionError = null;
       close();
@@ -751,19 +1090,20 @@ function openModal(title: string, sub: string, children: (Node | string)[]): () 
 }
 
 function openModalRaw(title: string, body: Node): () => void {
-  const onKey = (e: KeyboardEvent) => {
+  const onKey = (e: KeyboardEvent): void => {
     if (e.key === "Escape") close();
   };
-  const modal = el("div", { class: "modal", role: "dialog", "aria-modal": "true", "aria-label": title }, [
-    el("h3", {}, [title]),
-    body,
-  ]);
-  const scrim = el("div", {
-    class: "scrim",
-    onclick: (e) => {
-      if (e.target === scrim) close();
+  const modal = el("div", { class: "modal", role: "dialog", "aria-modal": "true", "aria-label": title }, [el("h3", {}, [title]), body]);
+  const scrim = el(
+    "div",
+    {
+      class: "scrim",
+      onclick: (e) => {
+        if (e.target === scrim) close();
+      },
     },
-  }, [modal]);
+    [modal],
+  );
   document.body.append(scrim);
   document.addEventListener("keydown", onKey);
   function close(): void {
@@ -773,8 +1113,30 @@ function openModalRaw(title: string, body: Node): () => void {
   return close;
 }
 
+/** A defensive Storage wrapper: in-memory if localStorage is unavailable. */
+function safeStorage(): StorageLike {
+  try {
+    if (typeof localStorage !== "undefined") {
+      const probe = "ce-chat:probe";
+      localStorage.setItem(probe, "1");
+      localStorage.removeItem(probe);
+      return localStorage;
+    }
+  } catch {
+    /* fall through to memory */
+  }
+  const m = new Map<string, string>();
+  return {
+    getItem: (k) => (m.has(k) ? m.get(k)! : null),
+    setItem: (k, v) => void m.set(k, v),
+    removeItem: (k) => void m.delete(k),
+  };
+}
+
 // Clean up timers if the page is torn down.
-window.addEventListener("beforeunload", () => {
-  app?.service.stop();
-  stopTimers();
-});
+if (typeof window !== "undefined") {
+  window.addEventListener("beforeunload", () => {
+    app?.service.stop();
+    stopTimers();
+  });
+}

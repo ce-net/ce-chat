@@ -7,11 +7,43 @@
 import { CeClient, bytesToUtf8 } from "@ce-net/sdk";
 import type { MeshLike, MeshFrame } from "./service.ts";
 
-/** Where the local node's HTTP+SSE API lives. */
+/** Where the local node's HTTP+SSE API lives by default. */
 export const DEFAULT_NODE_URL =
   typeof window !== "undefined" && window.location.origin.startsWith("http")
     ? `${window.location.origin}/ce-api` // dev: proxied by Vite to 127.0.0.1:8844
     : "http://127.0.0.1:8844";
+
+/**
+ * Resolve the effective node URL. Precedence: an explicit override (e.g. from
+ * localStorage) > a `VITE_CE_NODE_URL` build-time env > {@link DEFAULT_NODE_URL}.
+ * An invalid override is ignored so a corrupt setting can never brick boot.
+ */
+export function resolveNodeUrl(override?: string | null): string {
+  const candidates = [override, readEnvNodeUrl()];
+  for (const c of candidates) {
+    if (typeof c === "string" && c.length > 0 && isHttpUrl(c)) return c;
+  }
+  return DEFAULT_NODE_URL;
+}
+
+function isHttpUrl(s: string): boolean {
+  try {
+    const u = new URL(s);
+    return u.protocol === "http:" || u.protocol === "https:";
+  } catch {
+    return false;
+  }
+}
+
+function readEnvNodeUrl(): string | undefined {
+  // import.meta.env is defined by Vite; guard for non-Vite (test) runs.
+  try {
+    const env = (import.meta as { env?: Record<string, string | undefined> }).env;
+    return env?.["VITE_CE_NODE_URL"];
+  } catch {
+    return undefined;
+  }
+}
 
 export interface Identity {
   nodeId: string;
@@ -52,7 +84,8 @@ export function meshAdapter(client: CeClient): MeshLike {
   };
 }
 
-function safeUtf8(bytes: Uint8Array): string {
+/** Decode mesh bytes to UTF-8, returning "" on invalid bytes (parseEnvelope drops it). */
+export function safeUtf8(bytes: Uint8Array): string {
   try {
     return bytesToUtf8(bytes);
   } catch {

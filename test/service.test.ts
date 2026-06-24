@@ -41,15 +41,15 @@ describe("ChatService join/send routing", () => {
     svc.startStream();
 
     const optimistic = await svc.send(ref.id, "hello mesh");
-    expect(optimistic.pending).toBe(true);
+    expect(optimistic.status).toBe("pending");
     // optimistic is in the log right away
     expect(svc.state(ref.id)!.store.list()).toHaveLength(1);
 
     await tick();
     const list = svc.state(ref.id)!.store.list();
-    // still one message (echo dedupes by id), now confirmed
+    // still one message (echo dedupes by (from,id)), now confirmed
     expect(list).toHaveLength(1);
-    expect(list[0]!.pending).toBe(false);
+    expect(list[0]!.status).toBe("sent");
     expect(list[0]!.isSelf).toBe(true);
     expect(list[0]!.text).toBe("hello mesh");
     svc.stop();
@@ -61,9 +61,11 @@ describe("ChatService join/send routing", () => {
     const ref = publicChannel("general");
     await svc.join(ref);
     await svc.send(ref.id, "wire check");
-    expect(mesh.published).toHaveLength(1);
-    expect(mesh.published[0]!.topic).toBe("ce-chat/channel/general");
-    const env = JSON.parse(mesh.published[0]!.text);
+    // join() also fires a best-effort history-request, so filter to the chat line.
+    const msgs = mesh.published.filter((p) => JSON.parse(p.text).t === "msg");
+    expect(msgs).toHaveLength(1);
+    expect(msgs[0]!.topic).toBe("ce-chat/channel/general");
+    const env = JSON.parse(msgs[0]!.text);
     expect(env).toMatchObject({ t: "msg", text: "wire check", name: "Alice" });
   });
 
@@ -181,7 +183,8 @@ describe("ChatService stream lifecycle", () => {
     await svc.join(publicChannel("general"));
     svc.startStream();
     await tick(5);
-    expect(onStreamError).toHaveBeenCalledOnce();
+    svc.stop(); // stop the reconnect loop before asserting
+    expect(onStreamError).toHaveBeenCalled();
     expect((onStreamError.mock.calls[0]![0] as Error).name).toBe("CeConnectionError");
   });
 

@@ -973,3 +973,276 @@ button {
   outline-offset: 2px;
   border-radius: 4px;
 }
+
+/* ------------------------------------------------------------ feature styles
+   Added in the hardening pass: reactions, threads, typing, mentions, unread
+   badges, message actions, edit/delete markers, retry. All use the existing
+   design tokens so the look stays consistent. */
+
+/* Unread badge + channel highlight in the sidebar. */
+.chan.unread .label {
+  font-weight: 600;
+  color: var(--ink-100);
+}
+.chan .badge {
+  margin-left: auto;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 11px;
+  font-weight: 700;
+  color: #06181b;
+  background: var(--aqua-400);
+  border-radius: 9px;
+}
+
+/* Message hover actions. */
+.msg {
+  position: relative;
+}
+.msg-actions {
+  position: absolute;
+  top: -10px;
+  right: 12px;
+  display: none;
+  gap: 2px;
+  padding: 2px;
+  background: var(--abyss-700);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  box-shadow: var(--shadow-panel);
+}
+.msg:hover .msg-actions {
+  display: flex;
+}
+.msg-actions button {
+  background: transparent;
+  border: 0;
+  color: var(--ink-300);
+  font-size: 12px;
+  padding: 3px 7px;
+  border-radius: 5px;
+  cursor: pointer;
+}
+.msg-actions button:hover {
+  background: var(--abyss-600);
+  color: var(--ink-100);
+}
+
+/* Reactions. */
+.reactions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 6px;
+}
+.reactions .chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: var(--abyss-700);
+  color: var(--ink-200);
+  cursor: pointer;
+}
+.reactions .chip.mine {
+  border-color: var(--aqua-500);
+  background: var(--aqua-glow);
+  color: var(--ink-100);
+}
+
+/* Emoji popover. */
+.emoji-pop {
+  position: fixed;
+  z-index: 90;
+  display: flex;
+  gap: 2px;
+  padding: 4px;
+  background: var(--abyss-700);
+  border: 1px solid var(--line);
+  border-radius: var(--r-md);
+  box-shadow: var(--shadow-panel);
+}
+.emoji-pop button {
+  font-size: 18px;
+  background: transparent;
+  border: 0;
+  padding: 4px 6px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.emoji-pop button:hover {
+  background: var(--abyss-600);
+}
+
+/* Mentions + inline code in message bodies. */
+.body .mention {
+  color: var(--aqua-300);
+  font-weight: 600;
+}
+.body .mention.self {
+  background: var(--aqua-glow);
+  border-radius: 4px;
+  padding: 0 3px;
+}
+.body .inline-code {
+  font-family: var(--font-mono);
+  font-size: 0.88em;
+  background: var(--abyss-850);
+  border: 1px solid var(--line);
+  border-radius: 4px;
+  padding: 0 4px;
+}
+
+/* Edited / deleted markers. */
+.head .edited {
+  font-size: 11px;
+  color: var(--ink-400);
+  margin-left: 6px;
+}
+.msg.deleted .body .tombstone {
+  font-style: italic;
+  color: var(--ink-400);
+}
+
+/* Retry button on a failed send. */
+.retry-btn {
+  margin-left: 8px;
+  font-size: 11px;
+  color: var(--coral-300);
+  background: transparent;
+  border: 1px solid var(--coral-400);
+  border-radius: 5px;
+  padding: 1px 6px;
+  cursor: pointer;
+}
+
+/* Typing indicator bar. */
+.typing-bar {
+  height: 0;
+  overflow: hidden;
+  padding: 0 24px;
+  font-size: 12px;
+  color: var(--ink-400);
+  font-style: italic;
+  transition: height 0.15s var(--ease);
+}
+.typing-bar.active {
+  height: 22px;
+  display: flex;
+  align-items: center;
+}
+
+/* Unread divider in the stream. */
+.unread-div {
+  text-align: center;
+  font-size: 11px;
+  color: var(--coral-300);
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  margin: 10px 0;
+  position: relative;
+}
+.unread-div::before,
+.unread-div::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  width: 38%;
+  height: 1px;
+  background: var(--coral-soft);
+}
+.unread-div::before { left: 0; }
+.unread-div::after { right: 0; }
+
+/* Thread side-pane. */
+.main-with-thread {
+  display: flex;
+  flex: 1;
+  min-width: 0;
+}
+.main-with-thread > .main {
+  flex: 1;
+  min-width: 0;
+}
+.thread-pane {
+  width: 340px;
+  border-left: 1px solid var(--line);
+  background: var(--abyss-850);
+  display: flex;
+  flex-direction: column;
+}
+.thread-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--line);
+}
+.thread-head h3 {
+  margin: 0;
+  font-size: 14px;
+}
+.thread-stream {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px;
+}
+.thread-sep {
+  font-size: 11px;
+  color: var(--ink-400);
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  margin: 10px 0;
+}
+.thread-composer {
+  display: flex;
+  gap: 8px;
+  padding: 12px;
+  border-top: 1px solid var(--line);
+}
+.thread-composer textarea {
+  flex: 1;
+  resize: none;
+  background: var(--abyss-800);
+  color: var(--ink-100);
+  border: 1px solid var(--line);
+  border-radius: var(--r-sm);
+  padding: 8px 10px;
+  font-family: inherit;
+}
+.thread-link {
+  display: inline-block;
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--aqua-300);
+  background: transparent;
+  border: 0;
+  cursor: pointer;
+  padding: 0;
+}
+
+/* Misc small buttons (topbar history, thread reply). */
+.ghost-btn {
+  background: transparent;
+  border: 1px solid var(--line);
+  color: var(--ink-300);
+  font-size: 12px;
+  padding: 3px 9px;
+  border-radius: var(--r-sm);
+  cursor: pointer;
+}
+.ghost-btn:hover {
+  color: var(--ink-100);
+  border-color: var(--aqua-500);
+}
+.btn.sm {
+  padding: 6px 12px;
+  font-size: 13px;
+}
