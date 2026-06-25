@@ -200,7 +200,7 @@ function skeletonRows(n: number): Node[] {
 function renderConnectError(err: unknown, retry: () => void): void {
   if (!root) return;
   const f = toFriendly(err);
-  const nodeUrl = resolveNodeUrl(loadNodeUrl(store));
+  const nodeUrl = resolveNodeUrl(loadNodeUrl(store)) || "your local node (same-origin /ce)";
   clear(root);
   root.append(
     el("div", { class: "shell" }, [
@@ -941,7 +941,7 @@ function openNodeUrlModal(): void {
   let value = loadNodeUrl(store) ?? "";
   const input = el("input", {
     value,
-    placeholder: "http://127.0.0.1:8844",
+    placeholder: "default: same-origin /ce (leave blank)",
     class: "mono",
     "aria-label": "Node URL",
     oninput: (e) => (value = (e.target as HTMLInputElement).value),

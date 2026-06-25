@@ -4,19 +4,23 @@
  * path, so the rest of the app (and all unit tests) stays SDK-agnostic.
  */
 
-import { CeClient, bytesToUtf8 } from "@ce-net/sdk";
+import { CeClient, bytesToUtf8, connectNode } from "@ce-net/sdk";
 import type { MeshLike, MeshFrame } from "./service.ts";
 
-/** Where the local node's HTTP+SSE API lives by default. */
-export const DEFAULT_NODE_URL =
-  typeof window !== "undefined" && window.location.origin.startsWith("http")
-    ? `${window.location.origin}/ce-api` // dev: proxied by Vite to 127.0.0.1:8844
-    : "http://127.0.0.1:8844";
+/**
+ * Sentinel for "use the mesh-native transport". When no explicit override URL is
+ * configured, ce-chat talks to its local node over the SAME-ORIGIN rail
+ * ({@link connectNode}: the in-tab `window.__ceNode` bridge if present, else the
+ * same-origin `/ce` reverse proxy). Both are same-origin, so the strict CSP
+ * (`connect-src 'self'`) holds — there is no `ce-net.com/*` or other remote hop.
+ */
+export const DEFAULT_NODE_URL = "" as const;
 
 /**
  * Resolve the effective node URL. Precedence: an explicit override (e.g. from
- * localStorage) > a `VITE_CE_NODE_URL` build-time env > {@link DEFAULT_NODE_URL}.
- * An invalid override is ignored so a corrupt setting can never brick boot.
+ * localStorage) > a `VITE_CE_NODE_URL` build-time env > the mesh-native default
+ * (empty string -> {@link connectNode}). An invalid override is ignored so a
+ * corrupt setting can never brick boot.
  */
 export function resolveNodeUrl(override?: string | null): string {
   const candidates = [override, readEnvNodeUrl()];
@@ -49,8 +53,14 @@ export interface Identity {
   nodeId: string;
 }
 
-/** Construct a client against the local node (optionally an explicit base URL). */
+/**
+ * Construct a client against the local node. With no `baseUrl` (the default), this
+ * uses the mesh-native, same-origin transport via {@link connectNode}. A non-empty
+ * `baseUrl` is an explicit user override (advanced "Node URL" setting) pointing at a
+ * specific node's HTTP+SSE API.
+ */
 export function makeClient(baseUrl: string = DEFAULT_NODE_URL): CeClient {
+  if (!baseUrl) return connectNode();
   return new CeClient({ baseUrl });
 }
 

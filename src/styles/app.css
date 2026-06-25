@@ -6,11 +6,10 @@
  * aqua ("bioluminescence") used sparingly for the active channel, presence, and
  * the send action; a coral-amber "signal" hue marks warnings/you/pending.
  * Type pairing: "Space Grotesk" (geometric, slightly quirky display sans) for UI,
- * "IBM Plex Mono" for node ids / topics. Both are loaded from the system stack if
- * the webfonts are unavailable, so the app never blocks on the network.
+ * "IBM Plex Mono" for node ids / topics. These resolve from the system font stack
+ * (see --font-* fallbacks below): no webfont is fetched, so the page never reaches
+ * off-origin and the strict CSP (connect-src 'self') holds.
  */
-
-@import url("https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap");
 
 :root {
   /* abyss palette */

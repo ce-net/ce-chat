@@ -57,18 +57,30 @@ npm install
 npm run dev          # opens http://localhost:5174
 ```
 
-The Vite dev server proxies `/ce-api/*` to `http://127.0.0.1:8844`, so the browser can POST
-and stream SSE against your local node without CORS friction. Open the app in two browsers /
-two machines (each running their own `ce start`) on the same mesh, join the same channel, and
-you will see each other's messages, reactions, threads, and presence in real time.
+The data path is the mesh-native, **same-origin** rail: `@ce-net/sdk`'s `connectNode()`
+picks the in-tab `window.__ceNode` bridge if present, else the same-origin `/ce` reverse
+proxy. The Vite dev server stands in for the `ce-app serve` layer and proxies `/ce/*` to
+`http://127.0.0.1:8844`, so the browser stays same-origin under the strict CSP
+(`connect-src 'self'`) and can POST + stream SSE with no CORS and no off-origin hop. Open
+the app in two browsers / two machines (each running their own `ce start`) on the same mesh,
+join the same channel, and you will see each other's messages, reactions, threads, and
+presence in real time.
 
 If the node isn't running you get a clear "Can't reach your CE node — `ce start`" screen with
 a retry and a "Change node URL" action, not a blank page.
 
-> **Production build.** `npm run build` emits a static `dist/`. Served from a real origin it
-> talks to `http://127.0.0.1:8844` directly; you may need the node's CORS allowance (or keep
-> using the dev proxy / a reverse proxy that exposes the node under `/ce-api`). Set
-> `VITE_CE_NODE_URL` at build time to bake in a different default.
+### Serve & expose over the mesh
+
+`npm run build` emits a static `dist/`. To host it the mesh-native way (strict CSP + the
+same-origin bridge + a same-origin `/ce` proxy injected for you), use **ce-app**:
+
+```bash
+ce-app register                  # claim this app's name on-chain + advertise (no hub)
+ce-app serve                     # build + host locally under the strict CSP, /ce -> 127.0.0.1:8844
+ce-app expose --domain ce-chat   # carry the local host onto https://ce-chat.user.ce-net.com over mesh ingress
+```
+
+There is no off-origin default: a served ce-chat talks ONLY to its local node.
 
 ## How channels map to the mesh
 
